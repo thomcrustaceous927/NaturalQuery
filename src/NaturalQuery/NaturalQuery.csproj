@@ -5,14 +5,19 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>NaturalQuery</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>Erickson Ivanowski</Authors>
     <Description>NL2SQL engine for .NET — convert natural language questions to SQL queries using LLMs</Description>
-    <PackageTags>nl2sql;natural-language;sql;ai;llm;bedrock;athena;analytics</PackageTags>
+    <PackageTags>nl2sql;natural-language;natural-language-processing;nlp;text-to-sql;sql;ai;llm;generative-ai;bedrock;claude;athena;analytics;reporting;conversational-bi</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/Garantify/NaturalQuery</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/erickson-ivanowski/NaturalQuery</RepositoryUrl>
     <InternalsVisibleTo>NaturalQuery.Tests</InternalsVisibleTo>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.BedrockRuntime" Version="3.*" />
