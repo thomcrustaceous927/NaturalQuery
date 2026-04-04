@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>NaturalQuery</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Erickson Ivanowski</Authors>
+    <Description>NL2SQL engine for .NET — convert natural language questions to SQL queries using LLMs</Description>
+    <PackageTags>nl2sql;natural-language;sql;ai;llm;bedrock;athena;analytics</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Garantify/NaturalQuery</RepositoryUrl>
+    <InternalsVisibleTo>NaturalQuery.Tests</InternalsVisibleTo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.BedrockRuntime" Version="3.*" />
+    <PackageReference Include="AWSSDK.Athena" Version="3.*" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.*" />
+  </ItemGroup>
+
+</Project>
