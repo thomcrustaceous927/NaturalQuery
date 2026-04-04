@@ -34,6 +34,12 @@ public class NaturalQueryOptions
     /// </summary>
     public string? CustomSystemPrompt { get; set; }
 
+    /// <summary>Cache time-to-live in minutes. Default: 5. Set to 0 to disable caching.</summary>
+    public int CacheTtlMinutes { get; set; } = 5;
+
+    /// <summary>Maximum requests per minute per tenant for rate limiting. Default: 60.</summary>
+    public int RateLimitPerMinute { get; set; } = 60;
+
     /// <summary>Additional SQL keywords to block (beyond the built-in list).</summary>
     public List<string> ForbiddenSqlKeywords { get; set; } = new();
 

@@ -22,8 +22,10 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.BedrockRuntime" Version="3.*" />
     <PackageReference Include="AWSSDK.Athena" Version="3.*" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="8.*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.*" />
+    <PackageReference Include="Npgsql" Version="8.*" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="8.*" />
   </ItemGroup>
 

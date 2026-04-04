@@ -4,8 +4,11 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using NaturalQuery.Caching;
+using NaturalQuery.Diagnostics;
 using NaturalQuery.Models;
 using NaturalQuery.Providers;
+using NaturalQuery.RateLimiting;
 using NaturalQuery.Validation;
 
 namespace NaturalQuery;
@@ -13,6 +16,7 @@ namespace NaturalQuery;
 /// <summary>
 /// Core NL2SQL engine. Converts natural language questions into SQL queries,
 /// validates them, executes them, and returns structured results.
+/// Supports caching, rate limiting, conversation context, diagnostics, and error handling.
 /// </summary>
 public class NaturalQueryEngine : INaturalQueryEngine
 {
@@ -20,64 +24,215 @@ public class NaturalQueryEngine : INaturalQueryEngine
     private readonly IQueryExecutor _queryExecutor;
     private readonly NaturalQueryOptions _options;
     private readonly ILogger<NaturalQueryEngine> _logger;
+    private readonly IQueryCache? _cache;
+    private readonly IRateLimiter? _rateLimiter;
+    private readonly IErrorHandler? _errorHandler;
 
+    /// <summary>
+    /// Initializes the NaturalQuery engine with all dependencies.
+    /// Cache, rate limiter, and error handler are optional.
+    /// </summary>
     public NaturalQueryEngine(
         ILlmProvider llmProvider,
         IQueryExecutor queryExecutor,
         IOptions<NaturalQueryOptions> options,
-        ILogger<NaturalQueryEngine> logger)
+        ILogger<NaturalQueryEngine> logger,
+        IQueryCache? cache = null,
+        IRateLimiter? rateLimiter = null,
+        IErrorHandler? errorHandler = null)
     {
         _llmProvider = llmProvider;
         _queryExecutor = queryExecutor;
         _options = options.Value;
         _logger = logger;
+        _cache = cache;
+        _rateLimiter = rateLimiter;
+        _errorHandler = errorHandler;
     }
 
     /// <inheritdoc />
-    public async Task<QueryResult> AskAsync(string question, string? tenantId = null, CancellationToken ct = default)
+    public async Task<QueryResult> AskAsync(string question, string? tenantId = null, ConversationContext? context = null, CancellationToken ct = default)
     {
+        using var activity = NaturalQueryDiagnostics.StartAsk(question, tenantId);
         var stopwatch = Stopwatch.StartNew();
 
-        var result = await InterpretAsync(question, tenantId, ct);
-
-        // Replace tenant placeholder
-        var sql = result.Sql;
-        if (!string.IsNullOrEmpty(_options.TenantIdPlaceholder) && !string.IsNullOrEmpty(tenantId))
-            sql = sql.Replace(_options.TenantIdPlaceholder, tenantId);
-
-        // Validate SQL
-        var error = SqlValidator.Validate(sql, _options.TenantIdColumn, tenantId, _options.ForbiddenSqlKeywords);
-        if (error != null)
-            throw new InvalidOperationException($"Invalid query: {error}");
-
-        // Execute
-        if (result.ChartType == ChartType.Table)
+        try
         {
-            result.TableData = await _queryExecutor.ExecuteTableQueryAsync(sql, ct);
+            // Rate limiting
+            if (_rateLimiter != null)
+            {
+                var allowed = await _rateLimiter.IsAllowedAsync(tenantId ?? "global", ct);
+                if (!allowed)
+                {
+                    var error = new NaturalQueryError
+                    {
+                        Question = question,
+                        ErrorType = "rate_limit",
+                        Message = "Rate limit exceeded.",
+                        TenantId = tenantId,
+                        ElapsedMs = stopwatch.ElapsedMilliseconds
+                    };
+                    await ReportErrorAsync(error, ct);
+                    throw new InvalidOperationException("Rate limit exceeded. Try again later.");
+                }
+            }
+
+            // Cache check
+            if (_cache != null)
+            {
+                var cached = await _cache.GetAsync(question, tenantId, ct);
+                if (cached != null)
+                {
+                    _logger.LogInformation("NaturalQuery cache hit for question: {Question}", question[..Math.Min(50, question.Length)]);
+                    NaturalQueryDiagnostics.RecordCacheHit(activity);
+                    return cached;
+                }
+            }
+
+            // Interpret
+            var result = await InterpretAsync(question, tenantId, context, ct);
+
+            // Replace tenant placeholder
+            var sql = result.Sql;
+            if (!string.IsNullOrEmpty(_options.TenantIdPlaceholder) && !string.IsNullOrEmpty(tenantId))
+                sql = sql.Replace(_options.TenantIdPlaceholder, tenantId);
+
+            // Validate SQL
+            var validationError = SqlValidator.Validate(sql, _options.TenantIdColumn, tenantId, _options.ForbiddenSqlKeywords);
+            if (validationError != null)
+            {
+                var error = new NaturalQueryError
+                {
+                    Question = question,
+                    Sql = sql,
+                    ErrorType = "validation",
+                    Message = validationError,
+                    TenantId = tenantId,
+                    TokensUsed = result.TokensUsed,
+                    ElapsedMs = stopwatch.ElapsedMilliseconds
+                };
+                await ReportErrorAsync(error, ct);
+                throw new InvalidOperationException($"Invalid query: {validationError}");
+            }
+
+            // Schema validation (if tables are configured)
+            if (_options.Tables.Count > 0)
+            {
+                var schemaError = SchemaValidator.ValidateColumns(sql, _options.Tables);
+                if (schemaError != null)
+                    _logger.LogWarning("Schema validation warning: {Warning}", schemaError);
+            }
+
+            // Execute
+            using var execActivity = NaturalQueryDiagnostics.StartQueryExecution(sql);
+            if (result.ChartType == ChartType.Table)
+            {
+                result.TableData = await _queryExecutor.ExecuteTableQueryAsync(sql, ct);
+            }
+            else
+            {
+                result.ChartData = await _queryExecutor.ExecuteChartQueryAsync(sql, ct);
+            }
+
+            stopwatch.Stop();
+            result.ElapsedMs = stopwatch.ElapsedMilliseconds;
+
+            NaturalQueryDiagnostics.RecordResult(activity, result.TokensUsed, result.ChartType, result.ElapsedMs);
+
+            _logger.LogInformation("NaturalQuery completed in {ElapsedMs}ms. Chart: {ChartType}, Tokens: {Tokens}",
+                result.ElapsedMs, result.ChartType, result.TokensUsed);
+
+            // Cache store
+            if (_cache != null)
+                await _cache.SetAsync(question, tenantId, result, ct);
+
+            // Add to conversation context
+            context?.AddTurn(question, result.Sql);
+
+            return result;
         }
-        else
+        catch (Exception ex) when (ex is not InvalidOperationException || _errorHandler != null)
         {
-            result.ChartData = await _queryExecutor.ExecuteChartQueryAsync(sql, ct);
+            NaturalQueryDiagnostics.RecordError(activity, ex);
+
+            if (_errorHandler != null && ex is not InvalidOperationException)
+            {
+                var error = new NaturalQueryError
+                {
+                    Question = question,
+                    ErrorType = ClassifyError(ex),
+                    Message = ex.Message,
+                    TenantId = tenantId,
+                    ElapsedMs = stopwatch.ElapsedMilliseconds,
+                    Exception = ex
+                };
+                await ReportErrorAsync(error, ct);
+            }
+
+            throw;
         }
-
-        stopwatch.Stop();
-        result.ElapsedMs = stopwatch.ElapsedMilliseconds;
-
-        _logger.LogInformation("NaturalQuery completed in {ElapsedMs}ms. Chart: {ChartType}, Tokens: {Tokens}",
-            result.ElapsedMs, result.ChartType, result.TokensUsed);
-
-        return result;
     }
 
     /// <inheritdoc />
-    public async Task<QueryResult> InterpretAsync(string question, string? tenantId = null, CancellationToken ct = default)
+    public async Task<QueryResult> InterpretAsync(string question, string? tenantId = null, ConversationContext? context = null, CancellationToken ct = default)
     {
         var systemPrompt = BuildSystemPrompt();
-        var response = await _llmProvider.GenerateAsync(systemPrompt, question, ct);
+
+        // Build user prompt with conversation context
+        var userPrompt = BuildUserPrompt(question, context);
+
+        using var llmActivity = NaturalQueryDiagnostics.StartLlmGeneration("configured");
+        var response = await _llmProvider.GenerateAsync(systemPrompt, userPrompt, ct);
 
         return ParseResponse(response);
     }
 
+    /// <inheritdoc />
+    public async Task<string> ExplainAsync(string sql, CancellationToken ct = default)
+    {
+        var prompt = $"Explain this SQL query in simple, plain language. Be concise (2-3 sentences max):\n\n{sql}";
+        var response = await _llmProvider.GenerateAsync(
+            "You are a SQL expert. Explain queries in simple language that non-technical people can understand. Be brief and clear.",
+            prompt, ct);
+
+        return response.Text.Trim();
+    }
+
+    /// <inheritdoc />
+    public async Task<List<string>> SuggestQuestionsAsync(int count = 5, CancellationToken ct = default)
+    {
+        var schemaText = BuildSchemaText();
+        var prompt = $"Given these database tables, suggest {count} useful analytical questions a business user might ask. Return ONLY a JSON array of strings, nothing else.\n\nTables:\n{schemaText}";
+
+        var response = await _llmProvider.GenerateAsync(
+            "You are a data analyst. Suggest practical, business-relevant questions. Return only a JSON array of strings.",
+            prompt, ct);
+
+        var text = response.Text.Trim();
+        if (text.StartsWith("```"))
+        {
+            var firstNl = text.IndexOf('\n');
+            if (firstNl > 0) text = text[(firstNl + 1)..];
+            if (text.EndsWith("```")) text = text[..^3];
+            text = text.Trim();
+        }
+
+        try
+        {
+            var suggestions = JsonSerializer.Deserialize<List<string>>(text);
+            return suggestions?.Take(count).ToList() ?? new List<string>();
+        }
+        catch (JsonException)
+        {
+            _logger.LogWarning("Could not parse LLM suggestions response as JSON array");
+            return new List<string>();
+        }
+    }
+
+    /// <summary>
+    /// Builds the system prompt from the configured options and table schemas.
+    /// Public for testing and debugging purposes.
+    /// </summary>
     public string BuildSystemPrompt()
     {
         if (!string.IsNullOrEmpty(_options.CustomSystemPrompt))
@@ -87,6 +242,99 @@ public class NaturalQueryEngine : INaturalQueryEngine
         }
 
         return GenerateDefaultPrompt();
+    }
+
+    /// <summary>
+    /// Parses a raw LLM response into a structured QueryResult.
+    /// Validates the SQL, extracts metadata, and handles edge cases.
+    /// Public for testing and debugging purposes.
+    /// </summary>
+    public static QueryResult ParseResponse(LlmResponse response)
+    {
+        var text = response.Text.Trim();
+
+        // Strip markdown fences
+        if (text.StartsWith("```"))
+        {
+            var firstNewline = text.IndexOf('\n');
+            if (firstNewline > 0) text = text[(firstNewline + 1)..];
+            if (text.EndsWith("```")) text = text[..^3];
+            text = text.Trim();
+        }
+
+        // Extract JSON object
+        var start = text.IndexOf('{');
+        var end = text.LastIndexOf('}');
+        if (start < 0 || end < 0 || end <= start)
+            throw new InvalidOperationException("Could not parse LLM response as JSON.");
+
+        text = text[start..(end + 1)];
+
+        JsonElement root;
+        try
+        {
+            root = JsonSerializer.Deserialize<JsonElement>(text);
+        }
+        catch (JsonException)
+        {
+            throw new InvalidOperationException("Could not parse LLM response as JSON.");
+        }
+
+        // Check for error response
+        if (root.TryGetProperty("error", out var errProp) && errProp.GetBoolean())
+        {
+            var msg = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : "Unknown error";
+            throw new InvalidOperationException(msg);
+        }
+
+        // Extract SQL (required)
+        var sql = root.TryGetProperty("sql", out var sqlProp) ? sqlProp.GetString() ?? "" : "";
+        if (string.IsNullOrWhiteSpace(sql))
+            throw new InvalidOperationException("LLM response is missing the 'sql' field.");
+
+        // Validate SQL structure
+        var sqlUpper = sql.Trim().ToUpperInvariant();
+        if (!sqlUpper.StartsWith("SELECT") && !sqlUpper.StartsWith("WITH"))
+            throw new InvalidOperationException("Only SELECT queries are allowed.");
+
+        // Remove string literals for false-positive prevention
+        var sqlNoStrings = Regex.Replace(sqlUpper, "'[^']*'", "''");
+        var forbidden = new[] { "DELETE ", "UPDATE ", " INSERT INTO", "DROP ", "ALTER ", "CREATE ", "TRUNCATE ", "GRANT ", "REVOKE " };
+        foreach (var word in forbidden)
+        {
+            if (sqlNoStrings.Contains(word))
+                throw new InvalidOperationException($"Forbidden SQL keyword: {word.Trim()}");
+        }
+
+        // Chart type
+        var chartType = root.TryGetProperty("chartType", out var ctProp) ? ctProp.GetString() ?? "table" : "table";
+        if (!ChartType.IsValid(chartType)) chartType = "table";
+
+        // Title & description
+        var title = root.TryGetProperty("title", out var titleProp) ? titleProp.GetString() ?? "" : "";
+        var description = root.TryGetProperty("description", out var descProp) ? descProp.GetString() ?? "" : "";
+
+        // Suggestions
+        var suggestions = new List<string>();
+        if (root.TryGetProperty("suggestions", out var sugProp) && sugProp.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in sugProp.EnumerateArray())
+            {
+                var s = item.GetString();
+                if (!string.IsNullOrWhiteSpace(s) && suggestions.Count < 3)
+                    suggestions.Add(s);
+            }
+        }
+
+        return new QueryResult
+        {
+            Sql = sql,
+            ChartType = chartType,
+            Title = title,
+            Description = description,
+            Suggestions = suggestions,
+            TokensUsed = response.TokensUsed
+        };
     }
 
     private string GenerateDefaultPrompt()
@@ -168,91 +416,43 @@ public class NaturalQueryEngine : INaturalQueryEngine
         return sb.ToString();
     }
 
-    public static QueryResult ParseResponse(LlmResponse response)
+    private static string BuildUserPrompt(string question, ConversationContext? context)
     {
-        var text = response.Text.Trim();
+        if (context == null || context.Turns.Count == 0)
+            return question;
 
-        // Strip markdown fences
-        if (text.StartsWith("```"))
+        var sb = new StringBuilder();
+        sb.AppendLine("Previous conversation:");
+        foreach (var turn in context.Turns)
         {
-            var firstNewline = text.IndexOf('\n');
-            if (firstNewline > 0) text = text[(firstNewline + 1)..];
-            if (text.EndsWith("```")) text = text[..^3];
-            text = text.Trim();
+            sb.AppendLine($"- User asked: \"{turn.Question}\"");
+            sb.AppendLine($"  Generated SQL: {turn.Sql}");
         }
+        sb.AppendLine();
+        sb.AppendLine($"New question (follow-up): {question}");
+        return sb.ToString();
+    }
 
-        // Extract JSON object
-        var start = text.IndexOf('{');
-        var end = text.LastIndexOf('}');
-        if (start < 0 || end < 0 || end <= start)
-            throw new InvalidOperationException("Could not parse LLM response as JSON.");
-
-        text = text[start..(end + 1)];
-
-        JsonElement root;
+    private async Task ReportErrorAsync(NaturalQueryError error, CancellationToken ct)
+    {
+        if (_errorHandler == null) return;
         try
         {
-            root = JsonSerializer.Deserialize<JsonElement>(text);
+            await _errorHandler.HandleAsync(error, ct);
         }
-        catch (JsonException)
+        catch (Exception ex)
         {
-            throw new InvalidOperationException("Could not parse LLM response as JSON.");
+            _logger.LogWarning(ex, "Error handler failed");
         }
-
-        // Check for error response
-        if (root.TryGetProperty("error", out var errProp) && errProp.GetBoolean())
-        {
-            var msg = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() : "Unknown error";
-            throw new InvalidOperationException(msg);
-        }
-
-        // Extract SQL (required)
-        var sql = root.TryGetProperty("sql", out var sqlProp) ? sqlProp.GetString() ?? "" : "";
-        if (string.IsNullOrWhiteSpace(sql))
-            throw new InvalidOperationException("LLM response is missing the 'sql' field.");
-
-        // Validate SQL
-        var sqlUpper = sql.Trim().ToUpperInvariant();
-        if (!sqlUpper.StartsWith("SELECT") && !sqlUpper.StartsWith("WITH"))
-            throw new InvalidOperationException("Only SELECT queries are allowed.");
-
-        // Remove string literals for false-positive prevention
-        var sqlNoStrings = Regex.Replace(sqlUpper, "'[^']*'", "''");
-        var forbidden = new[] { "DELETE ", "UPDATE ", " INSERT INTO", "DROP ", "ALTER ", "CREATE ", "TRUNCATE ", "GRANT ", "REVOKE " };
-        foreach (var word in forbidden)
-        {
-            if (sqlNoStrings.Contains(word))
-                throw new InvalidOperationException($"Forbidden SQL keyword: {word.Trim()}");
-        }
-
-        // Chart type
-        var chartType = root.TryGetProperty("chartType", out var ctProp) ? ctProp.GetString() ?? "table" : "table";
-        if (!ChartType.IsValid(chartType)) chartType = "table";
-
-        // Title & description
-        var title = root.TryGetProperty("title", out var titleProp) ? titleProp.GetString() ?? "" : "";
-        var description = root.TryGetProperty("description", out var descProp) ? descProp.GetString() ?? "" : "";
-
-        // Suggestions
-        var suggestions = new List<string>();
-        if (root.TryGetProperty("suggestions", out var sugProp) && sugProp.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in sugProp.EnumerateArray())
-            {
-                var s = item.GetString();
-                if (!string.IsNullOrWhiteSpace(s) && suggestions.Count < 3)
-                    suggestions.Add(s);
-            }
-        }
-
-        return new QueryResult
-        {
-            Sql = sql,
-            ChartType = chartType,
-            Title = title,
-            Description = description,
-            Suggestions = suggestions,
-            TokensUsed = response.TokensUsed
-        };
     }
+
+    private static string ClassifyError(Exception ex) => ex switch
+    {
+        TimeoutException => "timeout",
+        InvalidOperationException ioe when ioe.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) => "rate_limit",
+        InvalidOperationException ioe when ioe.Message.Contains("JSON", StringComparison.OrdinalIgnoreCase) => "parsing",
+        InvalidOperationException ioe when ioe.Message.Contains("Query failed", StringComparison.OrdinalIgnoreCase) => "execution",
+        InvalidOperationException => "validation",
+        _ => "unknown"
+    };
 }

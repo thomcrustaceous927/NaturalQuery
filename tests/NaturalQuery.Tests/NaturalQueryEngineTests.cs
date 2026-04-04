@@ -2,8 +2,11 @@ using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
+using NaturalQuery.Caching;
+using NaturalQuery.Diagnostics;
 using NaturalQuery.Models;
 using NaturalQuery.Providers;
+using NaturalQuery.RateLimiting;
 
 namespace NaturalQuery.Tests;
 
@@ -11,8 +14,15 @@ public class NaturalQueryEngineTests
 {
     private readonly Mock<ILlmProvider> _llmMock = new();
     private readonly Mock<IQueryExecutor> _executorMock = new();
+    private readonly Mock<IQueryCache> _cacheMock = new();
+    private readonly Mock<IRateLimiter> _rateLimiterMock = new();
+    private readonly Mock<IErrorHandler> _errorHandlerMock = new();
 
-    private NaturalQueryEngine CreateEngine(Action<NaturalQueryOptions>? configure = null)
+    private NaturalQueryEngine CreateEngine(
+        Action<NaturalQueryOptions>? configure = null,
+        IQueryCache? cache = null,
+        IRateLimiter? rateLimiter = null,
+        IErrorHandler? errorHandler = null)
     {
         var options = new NaturalQueryOptions
         {
@@ -35,8 +45,13 @@ public class NaturalQueryEngineTests
             _llmMock.Object,
             _executorMock.Object,
             Options.Create(options),
-            NullLogger<NaturalQueryEngine>.Instance);
+            NullLogger<NaturalQueryEngine>.Instance,
+            cache,
+            rateLimiter,
+            errorHandler);
     }
+
+    // ==================== BuildSystemPrompt ====================
 
     [Fact]
     public void BuildSystemPrompt_Should_Include_Table_Schema()
@@ -97,6 +112,8 @@ public class NaturalQueryEngineTests
 
         prompt.Should().Contain("Always use UTC dates");
     }
+
+    // ==================== ParseResponse ====================
 
     [Fact]
     public void ParseResponse_Should_Extract_All_Fields()
@@ -182,6 +199,8 @@ public class NaturalQueryEngineTests
         act.Should().Throw<InvalidOperationException>().WithMessage("Cannot understand*");
     }
 
+    // ==================== AskAsync ====================
+
     [Fact]
     public async Task AskAsync_Should_Replace_Tenant_Placeholder()
     {
@@ -243,5 +262,234 @@ public class NaturalQueryEngineTests
         result.ChartType.Should().Be("table");
         result.TableData.Should().HaveCount(1);
         result.ChartData.Should().BeNull();
+    }
+
+    // ==================== AskAsync with ConversationContext ====================
+
+    [Fact]
+    public async Task AskAsync_Should_Pass_Conversation_Context_To_LLM()
+    {
+        var engine = CreateEngine(o => { o.TenantIdColumn = null; o.TenantIdPlaceholder = null; });
+        var context = new ConversationContext();
+        context.AddTurn("previous question", "SELECT * FROM users");
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users WHERE status = 'active'","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Dictionary<string, string>>());
+
+        await engine.AskAsync("now filter by active", context: context);
+
+        _llmMock.Verify(x => x.GenerateAsync(
+            It.IsAny<string>(),
+            It.Is<string>(prompt => prompt.Contains("previous question") && prompt.Contains("follow-up")),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task AskAsync_Should_Add_Turn_To_Context_After_Success()
+    {
+        var engine = CreateEngine(o => { o.TenantIdColumn = null; o.TenantIdPlaceholder = null; });
+        var context = new ConversationContext();
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Dictionary<string, string>>());
+
+        await engine.AskAsync("list users", context: context);
+
+        context.Turns.Should().HaveCount(1);
+        context.Turns[0].Question.Should().Be("list users");
+    }
+
+    // ==================== Cache integration ====================
+
+    [Fact]
+    public async Task AskAsync_Should_Return_Cached_Result_On_Cache_Hit()
+    {
+        var cachedResult = new QueryResult
+        {
+            Sql = "SELECT * FROM users",
+            ChartType = "table",
+            Title = "Cached",
+            Description = "From cache"
+        };
+
+        _cacheMock.Setup(x => x.GetAsync("list users", "t1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cachedResult);
+
+        var engine = CreateEngine(cache: _cacheMock.Object);
+
+        var result = await engine.AskAsync("list users", "t1");
+
+        result.Title.Should().Be("Cached");
+        _llmMock.Verify(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AskAsync_Should_Call_LLM_On_Cache_Miss_And_Store_Result()
+    {
+        _cacheMock.Setup(x => x.GetAsync("list users", null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((QueryResult?)null);
+
+        var engine = CreateEngine(
+            o => { o.TenantIdColumn = null; o.TenantIdPlaceholder = null; },
+            cache: _cacheMock.Object);
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Dictionary<string, string>>());
+
+        await engine.AskAsync("list users");
+
+        _llmMock.Verify(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+        _cacheMock.Verify(x => x.SetAsync("list users", null, It.IsAny<QueryResult>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // ==================== Rate limiting ====================
+
+    [Fact]
+    public async Task AskAsync_Should_Pass_When_Rate_Limiter_Allows()
+    {
+        _rateLimiterMock.Setup(x => x.IsAllowedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var engine = CreateEngine(
+            o => { o.TenantIdColumn = null; o.TenantIdPlaceholder = null; },
+            rateLimiter: _rateLimiterMock.Object);
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Dictionary<string, string>>());
+
+        var result = await engine.AskAsync("list users");
+
+        result.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task AskAsync_Should_Throw_When_Rate_Limit_Exceeded()
+    {
+        _rateLimiterMock.Setup(x => x.IsAllowedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var engine = CreateEngine(rateLimiter: _rateLimiterMock.Object);
+
+        var act = () => engine.AskAsync("list users", "t1");
+
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*Rate limit*");
+    }
+
+    // ==================== Error handler ====================
+
+    [Fact]
+    public async Task AskAsync_Should_Call_Error_Handler_On_Rate_Limit()
+    {
+        _rateLimiterMock.Setup(x => x.IsAllowedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var engine = CreateEngine(
+            rateLimiter: _rateLimiterMock.Object,
+            errorHandler: _errorHandlerMock.Object);
+
+        try { await engine.AskAsync("list users", "t1"); } catch { }
+
+        _errorHandlerMock.Verify(x => x.HandleAsync(
+            It.Is<NaturalQueryError>(e => e.ErrorType == "rate_limit"),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // ==================== ExplainAsync ====================
+
+    [Fact]
+    public async Task ExplainAsync_Should_Return_LLM_Explanation()
+    {
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse("This query selects all users from the database.", 50));
+
+        var engine = CreateEngine();
+        var explanation = await engine.ExplainAsync("SELECT * FROM users");
+
+        explanation.Should().Be("This query selects all users from the database.");
+    }
+
+    [Fact]
+    public async Task ExplainAsync_Should_Trim_Response()
+    {
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse("  explanation with whitespace  ", 50));
+
+        var engine = CreateEngine();
+        var explanation = await engine.ExplainAsync("SELECT 1");
+
+        explanation.Should().Be("explanation with whitespace");
+    }
+
+    // ==================== SuggestQuestionsAsync ====================
+
+    [Fact]
+    public async Task SuggestQuestionsAsync_Should_Return_Suggestions()
+    {
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse("""["How many users?","Active users?","Users by status?"]""", 50));
+
+        var engine = CreateEngine();
+        var suggestions = await engine.SuggestQuestionsAsync(3);
+
+        suggestions.Should().HaveCount(3);
+        suggestions[0].Should().Be("How many users?");
+    }
+
+    [Fact]
+    public async Task SuggestQuestionsAsync_Should_Handle_Markdown_Fences()
+    {
+        var response = "```json\n[\"Question 1\",\"Question 2\"]\n```";
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(response, 50));
+
+        var engine = CreateEngine();
+        var suggestions = await engine.SuggestQuestionsAsync(2);
+
+        suggestions.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task SuggestQuestionsAsync_Should_Return_Empty_On_Invalid_Json()
+    {
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse("not json at all", 50));
+
+        var engine = CreateEngine();
+        var suggestions = await engine.SuggestQuestionsAsync();
+
+        suggestions.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task SuggestQuestionsAsync_Should_Limit_Results_To_Requested_Count()
+    {
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse("""["a","b","c","d","e","f","g"]""", 50));
+
+        var engine = CreateEngine();
+        var suggestions = await engine.SuggestQuestionsAsync(3);
+
+        suggestions.Should().HaveCount(3);
     }
 }
