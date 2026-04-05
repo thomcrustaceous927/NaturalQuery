@@ -123,16 +123,68 @@ public class NaturalQueryEngine : INaturalQueryEngine
                     _logger.LogWarning("Schema validation warning: {Warning}", schemaError);
             }
 
-            // Execute
-            using var execActivity = NaturalQueryDiagnostics.StartQueryExecution(sql);
-            if (result.ChartType == ChartType.Table)
+            // Execute with optional retry
+            var maxRetries = Math.Clamp(_options.MaxRetries, 0, 3);
+            Exception? lastExecutionError = null;
+
+            for (var attempt = 0; attempt <= maxRetries; attempt++)
             {
-                result.TableData = await _queryExecutor.ExecuteTableQueryAsync(sql, ct);
+                try
+                {
+                    if (attempt > 0)
+                    {
+                        _logger.LogWarning(
+                            "NaturalQuery retry attempt {Attempt}/{MaxRetries} for question: {Question}",
+                            attempt, maxRetries, question[..Math.Min(50, question.Length)]);
+
+                        // Build repair prompt and send to LLM
+                        var repairPrompt =
+                            $"The following SQL query failed with this error: {lastExecutionError!.Message}. " +
+                            $"Original question: {question}. " +
+                            $"Failed SQL: {sql}. " +
+                            $"Please fix the SQL and return the corrected JSON response.";
+
+                        var systemPrompt = BuildSystemPrompt();
+                        var repairResponse = await _llmProvider.GenerateAsync(systemPrompt, repairPrompt, ct);
+                        result = ParseResponse(repairResponse);
+
+                        // Replace tenant placeholder in the new SQL
+                        sql = result.Sql;
+                        if (!string.IsNullOrEmpty(_options.TenantIdPlaceholder) && !string.IsNullOrEmpty(tenantId))
+                            sql = sql.Replace(_options.TenantIdPlaceholder, tenantId);
+
+                        // Validate the new SQL
+                        var retryValidationError = SqlValidator.Validate(sql, _options.TenantIdColumn, tenantId, _options.ForbiddenSqlKeywords);
+                        if (retryValidationError != null)
+                        {
+                            lastExecutionError = new InvalidOperationException($"Invalid query: {retryValidationError}");
+                            continue;
+                        }
+                    }
+
+                    using var execActivity = NaturalQueryDiagnostics.StartQueryExecution(sql);
+                    if (result.ChartType == ChartType.Table)
+                    {
+                        result.TableData = await _queryExecutor.ExecuteTableQueryAsync(sql, ct);
+                    }
+                    else
+                    {
+                        result.ChartData = await _queryExecutor.ExecuteChartQueryAsync(sql, ct);
+                    }
+
+                    // Execution succeeded, break out of retry loop
+                    lastExecutionError = null;
+                    break;
+                }
+                catch (Exception ex) when (attempt < maxRetries)
+                {
+                    lastExecutionError = ex;
+                    _logger.LogWarning(ex, "NaturalQuery execution failed on attempt {Attempt}, will retry", attempt + 1);
+                }
             }
-            else
-            {
-                result.ChartData = await _queryExecutor.ExecuteChartQueryAsync(sql, ct);
-            }
+
+            if (lastExecutionError != null)
+                throw lastExecutionError;
 
             stopwatch.Stop();
             result.ElapsedMs = stopwatch.ElapsedMilliseconds;

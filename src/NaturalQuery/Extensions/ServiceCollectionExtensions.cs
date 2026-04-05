@@ -166,6 +166,38 @@ public class NaturalQueryBuilder
         return this;
     }
 
+    /// <summary>
+    /// Use a CSV file as the data source. The CSV is loaded into an in-memory SQLite
+    /// database on first query. Great for ad-hoc analytics on uploaded files.
+    /// </summary>
+    /// <param name="filePath">Path to the CSV file.</param>
+    /// <param name="tableName">Table name for the loaded data. Default: "data".</param>
+    public NaturalQueryBuilder UseCsvSource(string filePath, string tableName = "data")
+    {
+        _services.AddSingleton<IQueryExecutor>(sp =>
+        {
+            var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<CsvQueryExecutor>>();
+            return new CsvQueryExecutor(filePath, logger, tableName);
+        });
+        return this;
+    }
+
+    /// <summary>
+    /// Use a CSV stream as the data source. The CSV is loaded into an in-memory SQLite
+    /// database on first query. Great for ad-hoc analytics on uploaded files.
+    /// </summary>
+    /// <param name="csvStream">Stream containing CSV data.</param>
+    /// <param name="tableName">Table name for the loaded data. Default: "data".</param>
+    public NaturalQueryBuilder UseCsvSource(Stream csvStream, string tableName = "data")
+    {
+        _services.AddSingleton<IQueryExecutor>(sp =>
+        {
+            var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<CsvQueryExecutor>>();
+            return new CsvQueryExecutor(csvStream, logger, tableName);
+        });
+        return this;
+    }
+
     /// <summary>Use a custom query executor implementation.</summary>
     public NaturalQueryBuilder UseQueryExecutor<T>() where T : class, IQueryExecutor
     {

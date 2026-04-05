@@ -48,4 +48,11 @@ public class NaturalQueryOptions
     /// Useful for domain-specific guidance without replacing the entire prompt.
     /// </summary>
     public List<string> AdditionalRules { get; set; } = new();
+
+    /// <summary>
+    /// Maximum number of retry attempts when a generated query fails to execute.
+    /// The engine sends the error back to the LLM and asks it to fix the SQL.
+    /// Default: 0 (no retries). Maximum: 3.
+    /// </summary>
+    public int MaxRetries { get; set; } = 0;
 }

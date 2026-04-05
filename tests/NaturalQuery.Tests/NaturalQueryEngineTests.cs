@@ -492,4 +492,135 @@ public class NaturalQueryEngineTests
 
         suggestions.Should().HaveCount(3);
     }
+
+    // ==================== Auto-retry ====================
+
+    [Fact]
+    public async Task AskAsync_Should_Not_Retry_When_MaxRetries_Is_Zero()
+    {
+        var engine = CreateEngine(o =>
+        {
+            o.TenantIdColumn = null;
+            o.TenantIdPlaceholder = null;
+            o.MaxRetries = 0;
+        });
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Exception("Query failed: unknown column 'xyz'"));
+
+        var act = () => engine.AskAsync("list users");
+
+        await act.Should().ThrowAsync<Exception>().WithMessage("*unknown column*");
+
+        // LLM should only be called once (no retry)
+        _llmMock.Verify(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task AskAsync_Should_Retry_And_Succeed_On_Second_Attempt()
+    {
+        var engine = CreateEngine(o =>
+        {
+            o.TenantIdColumn = null;
+            o.TenantIdPlaceholder = null;
+            o.MaxRetries = 2;
+        });
+
+        // First call: returns SQL that will fail execution
+        // Second call (repair): returns fixed SQL
+        var callCount = 0;
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() =>
+            {
+                callCount++;
+                if (callCount == 1)
+                    return new LlmResponse(
+                        """{"sql":"SELECT xyz FROM users","chartType":"table","title":"T","description":"D"}""",
+                        100);
+                return new LlmResponse(
+                    """{"sql":"SELECT name FROM users","chartType":"table","title":"Fixed","description":"D"}""",
+                    80);
+            });
+
+        var execCallCount = 0;
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() =>
+            {
+                execCallCount++;
+                if (execCallCount == 1)
+                    throw new Exception("Query failed: unknown column 'xyz'");
+                return new List<Dictionary<string, string>>
+                {
+                    new() { ["name"] = "Alice" }
+                };
+            });
+
+        var result = await engine.AskAsync("list users");
+
+        result.Title.Should().Be("Fixed");
+        result.TableData.Should().HaveCount(1);
+
+        // LLM called twice: initial + one retry
+        _llmMock.Verify(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task AskAsync_Should_Throw_Last_Error_When_All_Retries_Exhausted()
+    {
+        var engine = CreateEngine(o =>
+        {
+            o.TenantIdColumn = null;
+            o.TenantIdPlaceholder = null;
+            o.MaxRetries = 2;
+        });
+
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Exception("Query failed: persistent error"));
+
+        var act = () => engine.AskAsync("list users");
+
+        await act.Should().ThrowAsync<Exception>().WithMessage("*persistent error*");
+
+        // LLM called 3 times: initial + 2 retries
+        _llmMock.Verify(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task AskAsync_Retry_Prompt_Should_Contain_Error_Message()
+    {
+        var engine = CreateEngine(o =>
+        {
+            o.TenantIdColumn = null;
+            o.TenantIdPlaceholder = null;
+            o.MaxRetries = 1;
+        });
+
+        var llmCalls = new List<string>();
+        _llmMock.Setup(x => x.GenerateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Callback<string, string, CancellationToken>((sys, user, _) => llmCalls.Add(user))
+            .ReturnsAsync(new LlmResponse(
+                """{"sql":"SELECT * FROM users","chartType":"table","title":"T","description":"D"}""",
+                100));
+
+        _executorMock.Setup(x => x.ExecuteTableQueryAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Exception("Query failed: column 'abc' not found"));
+
+        try { await engine.AskAsync("list users"); } catch { }
+
+        // Second LLM call should be the repair prompt containing the error
+        llmCalls.Should().HaveCount(2);
+        llmCalls[1].Should().Contain("column 'abc' not found");
+        llmCalls[1].Should().Contain("list users");
+        llmCalls[1].Should().Contain("fix the SQL");
+    }
 }
